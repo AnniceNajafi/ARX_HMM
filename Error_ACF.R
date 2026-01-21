@@ -90,10 +90,9 @@ all_errors <- tibble(
 
 plt_E <- ggplot(all_errors, aes(x = t, y = Error)) +
   geom_line(color = "#001F3D", linewidth = 1) +
-  facet_wrap(~Module, scales = "free_y", ncol = 2) +
+  facet_wrap(~Module, scales = "free_y", ncol = 1) +
   labs(
     title = "Time Series of Errors (All Modules)",
-    subtitle = "Notice which ones drift (Plant) vs which look noisier (Sensors)",
     x = "Time (s)", y = "Error Value", tag = "C"
   ) +
   theme_minimal(base_size = 12) +
@@ -118,10 +117,9 @@ plt_F <- ggplot(acf_data, aes(x = lag, y = acf)) +
   geom_hline(yintercept = c(ci_bound, -ci_bound), linetype = "dashed", color = "darkred") +
   geom_hline(yintercept = 0, color = "black") +
   geom_segment(aes(xend = lag, yend = 0), color = "#001F3D", linewidth = 1.5) +
-  facet_wrap(~Module, ncol = 2) +
+  facet_wrap(~Module, ncol = 1) +
   labs(
     title = "Autocorrelation of Errors (All Modules)",
-    subtitle = "Tall bars = Missing Physics. Short bars = Pure Noise.",
     x = "Lag", y = "ACF", tag = "D"
   ) +
   theme_minimal(base_size = 12) +
@@ -133,7 +131,7 @@ print(plt_E)
 print(plt_F)
 
 
-(plt.A+plt.B)/(plt_E)/plt_F
+(plt.A+plt.B)/(plt_E+plt_F)
 
 
 
