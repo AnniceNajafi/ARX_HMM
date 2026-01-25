@@ -127,8 +127,8 @@ simulate_with_faults <- function(params, schedule) {
   u_act_A <- sim_arx(u_cmd,   y_seed = u_act_P[1:params$na_cmd],   arx_cmd)
   xpos_A  <- sim_arx(u_act_A, y_seed = x_pos_P[1:params$na_plant], arx_plant)
   xvel_A  <- c(0, diff(xpos_A)/params$dt)
-  yA_A    <- sim_arx(x_pos_P, y_seed = yA_P[1:params$na_sens],     arx_sa)
-  yB_A    <- sim_arx(x_pos_P, y_seed = yB_P[1:params$na_sens],     arx_sb)
+  yA_A    <- sim_arx(xpos_A, y_seed = yA_P[1:params$na_sens],     arx_sa)
+  yB_A    <- sim_arx(xpos_A, y_seed = yB_P[1:params$na_sens],     arx_sb)
   y_fused_A <- params$alpha*yA_A + (1 - params$alpha)*yB_A
   z_A <- params$w1*xpos_A + params$w2*xvel_A
   
@@ -177,7 +177,13 @@ simulate_with_faults <- function(params, schedule) {
     e4  = z_A_fault        - z_P
   )
   
-  list(E = E, t = t, regime_t = regime_by_t)
+  list(
+    E = E, t = t, regime_t = regime_by_t,
+    u_act_A = u_act_A, xpos_A = x_pos_A_fault, yA_A = yA_A_fault, yB_A = yB_A_fault,
+    y_fused_A = y_fused_A_fault, z_A = z_A_fault,
+    u_act_P = u_act_P, x_pos_P = x_pos_P, yA_P = yA_P, yB_P = yB_P,
+    y_fused_P = y_fused_P, z_P = z_P
+  )
 }
 
 
@@ -185,6 +191,20 @@ sim <- simulate_with_faults(params, schedule)
 E    <- sim$E
 t    <- sim$t
 gt   <- tibble::tibble(t = t, regime = sim$regime_t)
+
+# Extract individual signals for use in TargetedIntervention.R
+u_act_A   <- sim$u_act_A
+xpos_A    <- sim$xpos_A
+yA_A      <- sim$yA_A
+yB_A      <- sim$yB_A
+y_fused_A <- sim$y_fused_A
+z_A       <- sim$z_A
+u_act_P   <- sim$u_act_P
+x_pos_P   <- sim$x_pos_P
+yA_P      <- sim$yA_P
+yB_P      <- sim$yB_P
+y_fused_P <- sim$y_fused_P
+z_P       <- sim$z_P
 
 
 feat <- E %>%

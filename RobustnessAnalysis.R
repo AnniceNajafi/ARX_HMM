@@ -125,8 +125,8 @@ run_one <- function(
   u_act_A <- sim_arx(u_cmd, y_seed=u_act_P[1:base$na_cmd], arx_cmd)
   xpos_A  <- sim_arx(u_act_A, y_seed=x_pos_P[1:na_plant], arx_plant)
   xvel_A  <- c(0, diff(xpos_A)/base$dt)
-  yA_A    <- sim_arx(x_pos_P, y_seed=yA_P[1:base$na_sens], arx_sa)
-  yB_A    <- sim_arx(x_pos_P, y_seed=yB_P[1:base$na_sens], arx_sb)
+  yA_A    <- sim_arx(xpos_A, y_seed=yA_P[1:base$na_sens], arx_sa)
+  yB_A    <- sim_arx(xpos_A, y_seed=yB_P[1:base$na_sens], arx_sb)
   y_fused_A <- alpha_fuse*yA_A + (1-alpha_fuse)*yB_A
   z_A <- base$w1*xpos_A + base$w2*xvel_A
   
@@ -219,8 +219,8 @@ p_sa2 <- sa2 %>%
   facet_grid(sa_lab ~ sb_lab) +
   scale_x_continuous(breaks = alphas) +
   labs(title="Robustness to fusion and noise",
-       x="Fusion weight α (A vs B)",
-       y="ΔRMSE_e1 (%)") +
+       x=TeX("Fusion weight $\alpha$ (A vs B)"),
+       y=TeX("$\\Delta$ RMSE_e1 (%)")) +
   theme_minimal(base_size = 16)+
   theme(panel.grid.major = element_blank(),
         #panel.grid.minor = element_blank(),
