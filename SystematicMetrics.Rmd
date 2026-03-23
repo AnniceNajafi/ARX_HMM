@@ -1,0 +1,468 @@
+---
+title: "Systematic Correction Metrics and Baseline Comparisons"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r}
+suppressPackageStartupMessages({
+library(tidyverse)
+library(depmixS4)
+library(clue)
+library(patchwork)
+library(knitr)
+})
+```
+
+```{r}
+params <- list(
+dt = 0.02, T = 20, seed = 11L,
+tau_cmd = 0.15, cmd_proc_std = 0.005,
+m = 1.0, c = 0.4, k = 4.0, plant_proc_std = 0.04,
+tau_sa = 0.08, sa_meas_std = 0.03, sa_bias = 0.0,
+tau_sb = 0.25, sb_meas_std = 0.02, sb_bias = 0.01,
+alpha = 0.6, w1 = 1.0, w2 = 0.2,
+train_frac = 0.5, na_cmd = 1L, nb_cmd = 1L,
+na_plant = 2L, nb_plant = 2L,
+na_sens = 1L, nb_sens = 1L, K = 4
+)
+
+schedule <- tibble::tribble(
+~regime, ~t_start, ~t_end,
+"Nominal",      0.0,     5.0,
+"SensorNoisy",  5.0,    10.0,
+"DynamicsOff", 10.0,    14.5,
+"Drift",       14.5,    params$T
+)
+
+regime_order <- c("Nominal", "SensorNoisy", "DynamicsOff", "Drift")
+ch_names <- c("e0","e1","e2a","e2b","e3","e4")
+lab_map <- c(e0="M0 (Actuator)", e1="M1 (Plant)", e2a="M2a (Sensor A)",
+             e2b="M2b (Sensor B)", e3="M3 (Fusion)", e4="M4 (KPI)")
+```
+
+```{r}
+make_u_cmd <- function(n, amp = 1.0, dt = 0.02) {
+t <- (0:(n-1)) * dt
+u <- 0.6 * sin(2*pi*0.25*t) + 0.4 * sign(sin(2*pi*0.05*t))
+step_every <- as.integer(2.5/dt)
+for (i in seq(1, n, by = step_every)) u[i:n] <- u[i:n] + 0.2 * rnorm(1)
+amp * u
+}
+
+lpf_first_order <- function(u, tau, dt, proc_std = 0.0) {
+n <- length(u); y <- numeric(n)
+a <- exp(-dt / max(tau, 1e-6))
+for (k in 2:n) y[k] <- a*y[k-1] + (1 - a)*u[k-1] + proc_std*rnorm(1)
+y
+}
+
+plant_msd <- function(u, dt, m, c, k, proc_std = 0.0) {
+n <- length(u); x <- numeric(n); v <- numeric(n)
+for (kk in 2:n) {
+  acc <- (u[kk-1] - c*v[kk-1] - k*x[kk-1]) / m + proc_std*rnorm(1)
+  v[kk] <- v[kk-1] + dt*acc
+  x[kk] <- x[kk-1] + dt*v[kk-1]
+}
+list(pos = x, vel = v)
+}
+
+sensor_first_order <- function(xpos, dt, tau, meas_std = 0.0, bias = 0.0) {
+y <- lpf_first_order(xpos, tau, dt, 0)
+y + bias + rnorm(length(y), sd = meas_std)
+}
+
+fit_arx <- function(y, u, na, nb) {
+kmax <- length(y); p <- max(na, nb)
+rows <- vector("list", kmax - p); Tvec <- numeric(kmax - p)
+for (k in (p+1):kmax) {
+  phi <- c(sapply(1:na, function(i) y[k-i]), sapply(1:nb, function(j) u[k-j]))
+  rows[[k - p]] <- phi; Tvec[k - p] <- y[k]
+}
+Phi <- do.call(rbind, rows)
+theta <- as.numeric(solve(t(Phi) %*% Phi, t(Phi) %*% Tvec))
+list(theta = theta, na = na, nb = nb)
+}
+
+sim_arx <- function(u, y_seed, model) {
+na <- model$na; nb <- model$nb; theta <- model$theta
+n <- length(u); yhat <- numeric(n)
+yhat[1:na] <- tail(y_seed, na)
+p <- max(na, nb)
+for (k in (p+1):n) {
+  phi <- c(sapply(1:na, function(i) yhat[k-i]), sapply(1:nb, function(j) u[k-j]))
+  yhat[k] <- sum(theta * phi)
+}
+yhat
+}
+
+ema_smooth <- function(x, a) {
+out <- numeric(length(x)); out[1] <- x[1]
+for (i in 2:length(x)) out[i] <- a * x[i] + (1 - a) * out[i - 1]
+out
+}
+
+rate_limit <- function(x, max_step) {
+out <- numeric(length(x)); out[1] <- x[1]
+for (i in 2:length(x)) {
+  step <- x[i] - out[i - 1]
+  step <- pmin(pmax(step, -max_step), max_step)
+  out[i] <- out[i - 1] + step
+}
+out
+}
+
+rmse <- function(x) sqrt(mean(x^2))
+mae <- function(x) mean(abs(x))
+```
+
+```{r}
+set.seed(params$seed)
+n <- as.integer(params$T / params$dt)
+t <- (0:(n-1)) * params$dt
+u_cmd <- make_u_cmd(n, dt = params$dt)
+
+u_act_P <- lpf_first_order(u_cmd, params$tau_cmd, params$dt, params$cmd_proc_std)
+pl <- plant_msd(u_act_P, params$dt, params$m, params$c, params$k, params$plant_proc_std)
+x_pos_P <- pl$pos; x_vel_P <- pl$vel
+yA_P <- sensor_first_order(x_pos_P, params$dt, params$tau_sa, params$sa_meas_std, params$sa_bias)
+yB_P <- sensor_first_order(x_pos_P, params$dt, params$tau_sb, params$sb_meas_std, params$sb_bias)
+y_fused_P <- params$alpha * yA_P + (1 - params$alpha) * yB_P
+z_P <- params$w1 * x_pos_P + params$w2 * x_vel_P
+
+split <- as.integer(params$train_frac * n)
+arx_cmd   <- fit_arx(u_act_P[1:split], u_cmd[1:split], params$na_cmd, params$nb_cmd)
+arx_plant <- fit_arx(x_pos_P[1:split], u_act_P[1:split], params$na_plant, params$nb_plant)
+arx_sa    <- fit_arx(yA_P[1:split], x_pos_P[1:split], params$na_sens, params$nb_sens)
+arx_sb    <- fit_arx(yB_P[1:split], x_pos_P[1:split], params$na_sens, params$nb_sens)
+
+u_act_A <- sim_arx(u_cmd, y_seed = u_act_P[1:params$na_cmd], arx_cmd)
+xpos_A  <- sim_arx(u_act_A, y_seed = x_pos_P[1:params$na_plant], arx_plant)
+xvel_A  <- c(0, diff(xpos_A) / params$dt)
+yA_A    <- sim_arx(xpos_A, y_seed = yA_P[1:params$na_sens], arx_sa)
+yB_A    <- sim_arx(xpos_A, y_seed = yB_P[1:params$na_sens], arx_sb)
+y_fused_A <- params$alpha * yA_A + (1 - params$alpha) * yB_A
+z_A <- params$w1 * xpos_A + params$w2 * xvel_A
+
+regime_by_t <- rep("Nominal", n)
+for (r in seq_len(nrow(schedule))) {
+  idx <- which(t >= schedule$t_start[r] & t < schedule$t_end[r])
+  regime_by_t[idx] <- schedule$regime[r]
+}
+
+x_pos_A_fault <- xpos_A; yA_A_fault <- yA_A; yB_A_fault <- yB_A
+for (k_i in seq_len(n)) {
+  reg <- regime_by_t[k_i]
+  if (reg == "SensorNoisy") {
+    yA_A_fault[k_i] <- yA_A_fault[k_i] + rnorm(1, 0, 0.06)
+    yB_A_fault[k_i] <- yB_A_fault[k_i] + rnorm(1, 0, 0.05)
+  } else if (reg == "DynamicsOff") {
+    x_pos_A_fault[k_i] <- 0.8 * x_pos_A_fault[k_i]
+  } else if (reg == "Drift") {
+    yA_A_fault[k_i] <- yA_A_fault[k_i] + 0.0007 * (k_i - 1)
+  }
+}
+y_fused_A_fault <- params$alpha * yA_A_fault + (1 - params$alpha) * yB_A_fault
+z_A_fault <- params$w1 * x_pos_A_fault + params$w2 * c(0, diff(x_pos_A_fault) / params$dt)
+
+E <- tibble::tibble(t = t,
+  e0 = u_act_A - u_act_P, e1 = x_pos_A_fault - x_pos_P,
+  e2a = yA_A_fault - yA_P, e2b = yB_A_fault - yB_P,
+  e3 = y_fused_A_fault - y_fused_P, e4 = z_A_fault - z_P)
+
+gt <- tibble::tibble(t = t, regime = regime_by_t)
+```
+
+```{r}
+feat <- E %>%
+dplyr::transmute(t,
+  e0 = e0, e1 = e1, e2a = e2a, e2b = e2b, e3 = e3, e4 = e4,
+  e_abs_sum = abs(e0)+abs(e1)+abs(e2a)+abs(e2b)+abs(e3)+abs(e4),
+  e_rms = sqrt((e0^2+e1^2+e2a^2+e2b^2+e3^2+e4^2)/6),
+  e1_diff = c(0, diff(e1)), e3_diff = c(0, diff(e3))
+) %>%
+dplyr::mutate(dplyr::across(-t, ~ as.numeric(scale(.x))))
+
+Ez <- feat %>% dplyr::select(-t) %>% as.data.frame()
+fams <- rep(list(gaussian()), ncol(Ez))
+
+best_ll <- -Inf; best_fm <- NULL
+for (r in 1:10) {
+  mod <- depmix(response = lapply(names(Ez), function(nm) as.formula(paste0(nm, "~ 1"))),
+                data = Ez, nstates = params$K, family = fams)
+  fm_try <- tryCatch(fit(mod, verbose = FALSE), error = function(e) NULL)
+  if (!is.null(fm_try) && logLik(fm_try) > best_ll) {
+    best_ll <- logLik(fm_try); best_fm <- fm_try
+  }
+}
+fm <- best_fm
+
+gamma_df <- posterior(fm)
+K <- params$K
+vpath <- gamma_df$state
+```
+
+## 1. HMM Posterior-Weighted Correction (proposed method)
+
+```{r}
+mu_state <- tibble::tibble(state = 1:K)
+for (ch in ch_names) {
+  mu_state[[ch]] <- sapply(1:K, function(k_s) {
+    gamma_k <- gamma_df[[paste0("S", k_s)]]
+    if (sum(gamma_k) < 1e-12) return(0)
+    sum(gamma_k * E[[ch]]) / sum(gamma_k)
+  })
+}
+
+bias_z_from_gamma <- function(mu_k_vec, gamma_df, K) {
+  b <- numeric(nrow(gamma_df))
+  for (k_s in 1:K) b <- b + gamma_df[[paste0("S", k_s)]] * mu_k_vec[k_s]
+  b
+}
+
+CFG <- list(kappa = 0.8, ema_alpha = 0.15, r_max = 0.05)
+
+bias_z <- lapply(ch_names, function(nm) bias_z_from_gamma(mu_state[[nm]], gamma_df, K))
+names(bias_z) <- ch_names
+
+bias_corr_hmm <- lapply(ch_names, function(nm) {
+  b <- CFG$kappa * bias_z[[nm]]
+  b <- ema_smooth(b, CFG$ema_alpha)
+  rate_limit(b, CFG$r_max)
+})
+names(bias_corr_hmm) <- ch_names
+
+apply_correction <- function(bias_corr) {
+  u_act_C <- u_act_A - bias_corr$e0
+  xpos_C  <- xpos_A  - bias_corr$e1
+  xvel_C  <- c(0, diff(xpos_C) / params$dt)
+  yA_C    <- yA_A    - bias_corr$e2a
+  yB_C    <- yB_A    - bias_corr$e2b
+  y_fused_C <- params$alpha * yA_C + (1 - params$alpha) * yB_C
+  z_C       <- params$w1 * xpos_C + params$w2 * xvel_C
+  tibble::tibble(t = t,
+    e0 = u_act_C - u_act_P, e1 = xpos_C - x_pos_P,
+    e2a = yA_C - yA_P, e2b = yB_C - yB_P,
+    e3 = y_fused_C - y_fused_P, e4 = z_C - z_P)
+}
+
+E_hmm <- apply_correction(bias_corr_hmm)
+```
+
+## 2. Baseline Corrections
+
+```{r}
+bias_global <- lapply(ch_names, function(nm) rep(mean(E[[nm]]), n))
+names(bias_global) <- ch_names
+E_global <- apply_correction(bias_global)
+
+viterbi_means <- lapply(ch_names, function(nm) {
+  state_means <- sapply(1:K, function(k_s) {
+    idx <- which(vpath == k_s)
+    if (length(idx) == 0) return(0)
+    mean(E[[nm]][idx])
+  })
+  state_means[vpath]
+})
+names(viterbi_means) <- ch_names
+E_viterbi <- apply_correction(viterbi_means)
+
+win <- 51
+bias_rolling <- lapply(ch_names, function(nm) {
+  x <- E[[nm]]
+  out <- numeric(n)
+  for (i in 1:n) {
+    lo <- max(1, i - win %/% 2)
+    hi <- min(n, i + win %/% 2)
+    out[i] <- mean(x[lo:hi])
+  }
+  out
+})
+names(bias_rolling) <- ch_names
+E_rolling <- apply_correction(bias_rolling)
+```
+
+## 3. Overall RMSE Across All Modules
+
+```{r}
+compute_all_metrics <- function(E_corr, method_name) {
+  tibble::tibble(
+    Method = method_name,
+    Module = lab_map[ch_names],
+    Channel = ch_names,
+    RMSE_orig = sapply(ch_names, function(nm) rmse(E[[nm]])),
+    RMSE_corr = sapply(ch_names, function(nm) rmse(E_corr[[nm]])),
+    MAE_orig = sapply(ch_names, function(nm) mae(E[[nm]])),
+    MAE_corr = sapply(ch_names, function(nm) mae(E_corr[[nm]]))
+  ) %>%
+  dplyr::mutate(
+    dRMSE_pct = 100 * (RMSE_orig - RMSE_corr) / RMSE_orig,
+    dMAE_pct = 100 * (MAE_orig - MAE_corr) / MAE_orig
+  )
+}
+
+all_metrics <- bind_rows(
+  compute_all_metrics(E_hmm, "HMM Posterior (proposed)"),
+  compute_all_metrics(E_global, "Global Mean"),
+  compute_all_metrics(E_viterbi, "Viterbi Hard"),
+  compute_all_metrics(E_rolling, "Rolling Mean (w=51)")
+)
+
+cat("=== RMSE Reduction (%) by Method and Module ===\n\n")
+all_metrics %>%
+  dplyr::select(Method, Module, dRMSE_pct) %>%
+  tidyr::pivot_wider(names_from = Method, values_from = dRMSE_pct) %>%
+  dplyr::mutate(across(where(is.numeric), ~round(.x, 1))) %>%
+  kable(format = "pipe")
+```
+
+```{r}
+cat("\n=== MAE Reduction (%) by Method and Module ===\n\n")
+all_metrics %>%
+  dplyr::select(Method, Module, dMAE_pct) %>%
+  tidyr::pivot_wider(names_from = Method, values_from = dMAE_pct) %>%
+  dplyr::mutate(across(where(is.numeric), ~round(.x, 1))) %>%
+  kable(format = "pipe")
+```
+
+## 4. Per-Regime RMSE Breakdown (Proposed Method)
+
+```{r}
+regime_metrics <- list()
+for (reg in regime_order) {
+  idx <- which(gt$regime == reg)
+  row <- tibble::tibble(
+    Regime = reg,
+    Module = lab_map[ch_names],
+    Channel = ch_names,
+    RMSE_orig = sapply(ch_names, function(nm) rmse(E[[nm]][idx])),
+    RMSE_hmm  = sapply(ch_names, function(nm) rmse(E_hmm[[nm]][idx])),
+    dRMSE_pct = 100 * (RMSE_orig - RMSE_hmm) / RMSE_orig
+  )
+  regime_metrics[[reg]] <- row
+}
+
+regime_tbl <- bind_rows(regime_metrics)
+
+cat("=== Per-Regime RMSE Reduction (%) with HMM Correction ===\n\n")
+regime_tbl %>%
+  dplyr::select(Regime, Module, dRMSE_pct) %>%
+  tidyr::pivot_wider(names_from = Regime, values_from = dRMSE_pct) %>%
+  dplyr::mutate(across(where(is.numeric), ~round(.x, 1))) %>%
+  kable(format = "pipe")
+```
+
+## 5. Per-Regime Comparison Across All Methods
+
+```{r}
+regime_method_metrics <- list()
+methods_list <- list(
+  "HMM Posterior (proposed)" = E_hmm,
+  "Global Mean" = E_global,
+  "Viterbi Hard" = E_viterbi,
+  "Rolling Mean (w=51)" = E_rolling
+)
+
+for (reg in regime_order) {
+  idx <- which(gt$regime == reg)
+  for (mname in names(methods_list)) {
+    Ec <- methods_list[[mname]]
+    agg_orig <- sqrt(mean(rowSums(as.matrix(E[idx, ch_names])^2)))
+    agg_corr <- sqrt(mean(rowSums(as.matrix(Ec[idx, ch_names])^2)))
+    regime_method_metrics[[paste(reg, mname)]] <- tibble::tibble(
+      Regime = reg, Method = mname,
+      Aggregate_RMSE_orig = agg_orig,
+      Aggregate_RMSE_corr = agg_corr,
+      dRMSE_pct = 100 * (agg_orig - agg_corr) / agg_orig
+    )
+  }
+}
+
+regime_method_tbl <- bind_rows(regime_method_metrics)
+
+cat("=== Aggregate RMSE Reduction (%) by Regime and Method ===\n\n")
+regime_method_tbl %>%
+  dplyr::select(Regime, Method, dRMSE_pct) %>%
+  tidyr::pivot_wider(names_from = Method, values_from = dRMSE_pct) %>%
+  dplyr::mutate(across(where(is.numeric), ~round(.x, 1))) %>%
+  kable(format = "pipe")
+```
+
+## 6. Visualizations
+
+```{r fig.width=12, fig.height=6}
+summary_plot <- all_metrics %>%
+  dplyr::mutate(Module = factor(Module, levels = lab_map),
+                Method = factor(Method, levels = c("HMM Posterior (proposed)",
+                  "Viterbi Hard", "Rolling Mean (w=51)", "Global Mean")))
+
+ggplot(summary_plot, aes(x = Module, y = dRMSE_pct, fill = Method)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_hline(yintercept = 0, color = "black", linewidth = 0.4) +
+  scale_fill_manual(values = c(
+    "HMM Posterior (proposed)" = "#2d5a7b",
+    "Viterbi Hard" = "#547792",
+    "Rolling Mean (w=51)" = "#89a8b8",
+    "Global Mean" = "#b5c9d5")) +
+  labs(title = "RMSE Reduction by Module and Correction Method",
+       x = "", y = "RMSE Reduction (%)", fill = "Method") +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1), legend.position = "bottom")
+```
+
+```{r fig.width=12, fig.height=7}
+regime_method_tbl2 <- regime_method_tbl %>%
+  dplyr::mutate(
+    Regime = factor(Regime, levels = regime_order),
+    Method = factor(Method, levels = c("HMM Posterior (proposed)",
+      "Viterbi Hard", "Rolling Mean (w=51)", "Global Mean")))
+
+ggplot(regime_method_tbl2, aes(x = Regime, y = dRMSE_pct, fill = Method)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_hline(yintercept = 0, color = "black", linewidth = 0.4) +
+  scale_fill_manual(values = c(
+    "HMM Posterior (proposed)" = "#2d5a7b",
+    "Viterbi Hard" = "#547792",
+    "Rolling Mean (w=51)" = "#89a8b8",
+    "Global Mean" = "#b5c9d5")) +
+  labs(title = "Aggregate RMSE Reduction by Regime and Method",
+       x = "Regime", y = "Aggregate RMSE Reduction (%)", fill = "Method") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+```
+
+```{r fig.width=12, fig.height=8}
+regime_mod_plot <- regime_tbl %>%
+  dplyr::mutate(
+    Module = factor(Module, levels = lab_map),
+    Regime = factor(Regime, levels = regime_order))
+
+ggplot(regime_mod_plot, aes(x = Module, y = dRMSE_pct, fill = Regime)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_hline(yintercept = 0, color = "black", linewidth = 0.4) +
+  scale_fill_manual(values = c('Nominal' = 'darkgreen', 'SensorNoisy' = 'darkorange',
+                                'DynamicsOff' = 'darkred', 'Drift' = 'navy')) +
+  labs(title = "Per-Regime RMSE Reduction by Module (HMM Posterior Correction)",
+       x = "", y = "RMSE Reduction (%)", fill = "Regime") +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1), legend.position = "bottom")
+```
+
+## 7. Summary
+
+```{r}
+cat("=== Overall Summary (mean RMSE reduction across all modules) ===\n\n")
+all_metrics %>%
+  dplyr::group_by(Method) %>%
+  dplyr::summarise(
+    Mean_dRMSE_pct = round(mean(dRMSE_pct), 1),
+    Min_dRMSE_pct = round(min(dRMSE_pct), 1),
+    Max_dRMSE_pct = round(max(dRMSE_pct), 1),
+    Mean_dMAE_pct = round(mean(dMAE_pct), 1),
+    .groups = "drop"
+  ) %>%
+  kable(format = "pipe")
+```
